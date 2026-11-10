@@ -1,6 +1,6 @@
 # Claude Code Go Rate Limiter — Interview Starter
 
-A deliberately incomplete Go 1.22+ HTTP service for a 60-minute Senior Go Backend Engineer interview simulation. The HTTP server and package boundaries are in place; the in-memory limiter and inactive-entry cleanup are intentionally unfinished. Some tests are expected to fail until you implement the TODOs. The starter should compile.
+A Go 1.22+ HTTP service for a 60-minute Senior Go Backend Engineer interview simulation. `master` holds the starter scaffold: HTTP server, package boundaries and worker lifecycle in place, with the in-memory limiter and inactive-entry cleanup as TODO stubs whose behavioral tests fail by design. The `practice/rate-limiter` branch completes the exercise — fixed-window per-user limiter, cleanup, constructor validation and `test/e2e` integration tests — with the full suite green under `go test -race ./...`.
 
 ## Requirements
 
@@ -38,6 +38,7 @@ Default starter configuration: 5 requests per 10 seconds. Change values in `cmd/
 cmd/server/             application wiring and HTTP server
 internal/httpapi/       transport layer, status mapping, handler tests
 internal/limiter/       limiter contract, state, clock and cleanup tests
+test/e2e/               integration tests wiring store + handler over real HTTP
 docs/interview-guide.md interview plan, prompts, rubric and extensions
 ```
 
@@ -83,9 +84,9 @@ Prompt:
 
 Ask for severity-ranked findings with file/line references. Verify each finding yourself, then fix only substantiated issues.
 
-## Expected starter test state
+## Test state
 
-The project is designed to compile. `go test ./...` is expected to fail on behavioral assertions because `Store.Allow` and `Store.cleanup` are TODO stubs. Those are intentional exercise failures, not build failures. `go vet ./...` should pass. The worker lifecycle is scaffolded and has a test; you may improve it, but the distributed and algorithmic extensions below are discussion/optional follow-ups.
+The project compiles. On `master` the starter behaves as designed: `go test ./...` fails behavioral assertions because `Store.Allow` and `Store.cleanup` are TODO stubs — intentional exercise failures, not build failures — while `go vet ./...` passes. On `practice/rate-limiter` both TODOs are implemented (fixed window anchored at the user's first request, inclusive reset boundary, rejected requests still count as activity so cleanup cannot hand out a fresh window, cleanup sweep serialized on the same mutex as accounting) and `go test ./...`, `go test -race ./...` and `go vet ./...` all pass, including the `test/e2e` integration suite. The worker lifecycle is scaffolded and has a test; you may improve it, but the distributed and algorithmic extensions below are discussion/optional follow-ups.
 
 ## Git workflow
 
