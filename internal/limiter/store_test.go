@@ -27,15 +27,60 @@ func (c *fakeClock) Advance(d time.Duration) {
 	c.now = c.now.Add(d)
 }
 
-func testStore(clock Clock) *Store {
-	return NewStore(Config{
+func testStore(t *testing.T, clock Clock) *Store {
+	t.Helper()
+	s, err := NewStore(Config{
 		Limit: 3, Window: time.Minute,
 		InactiveAfter: 2 * time.Minute, CleanupInterval: time.Hour,
 	}, clock)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	return s
+}
+
+func TestNewStoreRejectsInvalidConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+	}{
+		{"zero limit", Config{Limit: 0, Window: time.Minute}},
+		{"negative limit", Config{Limit: -1, Window: time.Minute}},
+		{"zero window", Config{Limit: 3, Window: 0}},
+		{"negative window", Config{Limit: 3, Window: -time.Second}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := NewStore(tt.cfg, newFakeClock())
+			if err == nil {
+				t.Fatalf("NewStore(%+v) error = nil, want error", tt.cfg)
+			}
+			if s != nil {
+				t.Fatal("NewStore returned a non-nil Store alongside an error")
+			}
+		})
+	}
+
+	s, err := NewStore(Config{Limit: 3, Window: time.Minute, InactiveAfter: 2 * time.Minute}, newFakeClock())
+	if err != nil {
+		t.Fatalf("valid config rejected: %v", err)
+	}
+	if s == nil {
+		t.Fatal("valid config returned a nil Store")
+	}
+
+	// CleanupInterval <= 0 is normalized, not an error; InactiveAfter <= 0 is
+	// deliberately unvalidated (TestCleanupWorkerStops relies on zero).
+	if _, err := NewStore(Config{Limit: 3, Window: time.Minute, CleanupInterval: 0}, newFakeClock()); err != nil {
+		t.Fatalf("CleanupInterval normalization regressed: %v", err)
+	}
+	if _, err := NewStore(Config{Limit: 3, Window: time.Minute, InactiveAfter: 0}, newFakeClock()); err != nil {
+		t.Fatalf("InactiveAfter must stay unvalidated: %v", err)
+	}
 }
 
 func TestAllowWithinAndBeyondLimit(t *testing.T) {
-	s := testStore(newFakeClock())
+	s := testStore(t, newFakeClock())
 	for i := 0; i < 3; i++ {
 		if !s.Allow("alice") {
 			t.Fatalf("request %d unexpectedly rejected", i+1)
@@ -47,7 +92,7 @@ func TestAllowWithinAndBeyondLimit(t *testing.T) {
 }
 
 func TestUsersHaveIndependentLimits(t *testing.T) {
-	s := testStore(newFakeClock())
+	s := testStore(t, newFakeClock())
 	for i := 0; i < 3; i++ {
 		s.Allow("alice")
 	}
@@ -61,7 +106,7 @@ func TestUsersHaveIndependentLimits(t *testing.T) {
 
 func TestWindowResets(t *testing.T) {
 	clock := newFakeClock()
-	s := testStore(clock)
+	s := testStore(t, clock)
 	for i := 0; i < 3; i++ {
 		s.Allow("alice")
 	}
@@ -72,7 +117,7 @@ func TestWindowResets(t *testing.T) {
 }
 
 func TestConcurrentRequestsSameUser(t *testing.T) {
-	s := testStore(newFakeClock())
+	s := testStore(t, newFakeClock())
 	const workers = 100
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -95,7 +140,7 @@ func TestConcurrentRequestsSameUser(t *testing.T) {
 }
 
 func TestConcurrentDifferentUsers(t *testing.T) {
-	s := testStore(newFakeClock())
+	s := testStore(t, newFakeClock())
 	const users = 40
 	var wg sync.WaitGroup
 	for i := 0; i < users; i++ {
@@ -117,7 +162,7 @@ func TestConcurrentDifferentUsers(t *testing.T) {
 
 func TestCleanupRemovesInactiveEntries(t *testing.T) {
 	clock := newFakeClock()
-	s := testStore(clock)
+	s := testStore(t, clock)
 	s.Allow("alice")
 	clock.Advance(2 * time.Minute)
 	s.cleanup(clock.Now())
@@ -127,7 +172,10 @@ func TestCleanupRemovesInactiveEntries(t *testing.T) {
 }
 
 func TestCleanupWorkerStops(t *testing.T) {
-	s := NewStore(Config{Limit: 1, Window: time.Second, CleanupInterval: time.Millisecond}, newFakeClock())
+	s, err := NewStore(Config{Limit: 1, Window: time.Second, CleanupInterval: time.Millisecond}, newFakeClock())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
 	s.Start()
 	s.Close()
 	select {

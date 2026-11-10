@@ -1,6 +1,7 @@
 package limiter
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -41,9 +42,21 @@ type Store struct {
 	started bool
 }
 
-func NewStore(cfg Config, clock Clock) *Store {
+// NewStore constructs a Store from cfg. Policy that cannot express a quota is
+// rejected: Limit <= 0 or Window <= 0 returns a non-nil error and a nil Store;
+// callers must treat that as "do not start". A nil clock uses RealClock.
+// CleanupInterval <= 0 is normalized to one minute (it is a tuning parameter,
+// not policy). InactiveAfter is not validated: zero or negative is allowed but
+// evicts every entry on the next cleanup tick — keep it >= Window.
+func NewStore(cfg Config, clock Clock) (*Store, error) {
 	if clock == nil {
 		clock = RealClock{}
+	}
+	if cfg.Limit <= 0 {
+		return nil, fmt.Errorf("limiter: Limit must be > 0, got %d", cfg.Limit)
+	}
+	if cfg.Window <= 0 {
+		return nil, fmt.Errorf("limiter: Window must be > 0, got %v", cfg.Window)
 	}
 	if cfg.CleanupInterval <= 0 {
 		cfg.CleanupInterval = time.Minute
@@ -54,7 +67,7 @@ func NewStore(cfg Config, clock Clock) *Store {
 		clock:   clock,
 		stopCh:  make(chan struct{}),
 		doneCh:  make(chan struct{}),
-	}
+	}, nil
 }
 
 // Allow reports whether this request fits in the user's fixed window.

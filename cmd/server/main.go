@@ -14,12 +14,15 @@ import (
 )
 
 func main() {
-	store := limiter.NewStore(limiter.Config{
+	store, err := limiter.NewStore(limiter.Config{
 		Limit:           5,
 		Window:          10 * time.Second,
 		InactiveAfter:   time.Minute,
 		CleanupInterval: 15 * time.Second,
 	}, limiter.RealClock{})
+	if err != nil {
+		log.Fatalf("limiter config: %v", err)
+	}
 	store.Start()
 	defer store.Close()
 
