@@ -72,10 +72,46 @@ func NewStore(cfg Config, clock Clock) (*Store, error) {
 
 // Allow reports whether this request fits in the user's fixed window.
 //
-// TODO: implement per-user fixed-window accounting. Define behavior for invalid
-// configuration and exact window boundaries. All shared state must be protected.
+// Semantics (pinned by store_test.go):
+//   - The window is anchored at the arrival of the user's first request in it.
+//     A request with now.Sub(windowStart) >= Window (inclusive boundary) opens
+//     a new window anchored at its own arrival time and resets the count.
+//   - The first Limit requests per window are allowed; the count never carries
+//     across a reset.
+//   - lastSeen is refreshed on every request, allowed or rejected, so cleanup
+//     cannot evict a user who is still hammering and thereby hand them a fresh
+//     full window.
+//   - The clock is read before locking: one linearization timestamp per
+//     request and no callback while holding s.mu.
+//   - Config validity (Limit > 0, Window > 0) is guaranteed by NewStore, so
+//     no per-request fail-closed check is needed here.
+//   - userID is opaque policy-wise; blank/missing identity is the transport's
+//     400 contract (see internal/httpapi), never a limiter decision.
+//
+// Known fixed-window limitation: up to ~2x Limit across two adjacent window
+// boundaries. Accepted; a sliding window is an out-of-scope extension.
 func (s *Store) Allow(userID string) bool {
-	// TODO: replace this permissive scaffold with the limiter algorithm.
+	now := s.clock.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e := s.entries[userID]
+	if e == nil {
+		e = &entry{windowStart: now}
+		s.entries[userID] = e
+	}
+
+	if now.Sub(e.windowStart) >= s.cfg.Window {
+		e.windowStart = now
+		e.count = 0
+	}
+	e.lastSeen = now
+
+	if e.count >= s.cfg.Limit {
+		return false
+	}
+	e.count++
 	return true
 }
 
