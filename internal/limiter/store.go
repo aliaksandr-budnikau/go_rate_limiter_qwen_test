@@ -115,10 +115,23 @@ func (s *Store) Allow(userID string) bool {
 	return true
 }
 
-// cleanup removes entries that have been inactive for at least InactiveAfter.
-// TODO: implement deletion while preserving synchronization safety.
+// cleanup removes entries with now.Sub(lastSeen) >= InactiveAfter (inclusive
+// boundary, pinned by TestCleanupRemovesInactiveEntries). It holds the same
+// s.mu as Allow, so each sweep is one critical section: a request can never
+// observe a half-updated or concurrently-deleted entry — one arriving after
+// eviction simply recreates the window. Because Allow refreshes lastSeen on
+// rejected requests too, only genuinely silent users are evicted; an
+// over-limit hammerer keeps its window state and cannot farm fresh quotas.
+// With InactiveAfter <= 0 every stored entry is deleted on the next tick
+// (now - lastSeen >= 0 always); keep it >= Window.
 func (s *Store) cleanup(now time.Time) {
-	// TODO: iterate over entries and remove expired inactive users.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, e := range s.entries {
+		if now.Sub(e.lastSeen) >= s.cfg.InactiveAfter {
+			delete(s.entries, id) // delete-during-range is safe in Go
+		}
+	}
 }
 
 // Start launches one cleanup worker. It is safe to call more than once.

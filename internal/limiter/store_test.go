@@ -171,6 +171,40 @@ func TestCleanupRemovesInactiveEntries(t *testing.T) {
 	}
 }
 
+// TestRejectedRequestsKeepWindowStateAlive pins the choice that Allow
+// refreshes lastSeen on rejected requests too. If rejections did not count as
+// activity, cleanup could evict a user who is still hammering, and their next
+// request would recreate the entry with a fresh full window — a rate-limit
+// bypass. Needs a custom config (InactiveAfter < Window); testStore's ordering
+// makes the eviction unobservable.
+func TestRejectedRequestsKeepWindowStateAlive(t *testing.T) {
+	clock := newFakeClock()
+	s, err := NewStore(Config{
+		Limit: 1, Window: 10 * time.Minute,
+		InactiveAfter: time.Minute, CleanupInterval: time.Hour,
+	}, clock)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+
+	if !s.Allow("hammerer") {
+		t.Fatal("first request should be allowed")
+	}
+	clock.Advance(30 * time.Second)
+	if s.Allow("hammerer") {
+		t.Fatal("second request should be rejected")
+	}
+
+	clock.Advance(30 * time.Second) // lastSeen now 30s ago; window still open
+	s.cleanup(clock.Now())
+	if got := s.Len(); got != 1 {
+		t.Fatalf("stored users = %d, want 1: active-but-limited user was cleaned up", got)
+	}
+	if s.Allow("hammerer") {
+		t.Fatal("cleanup must not hand out a fresh window")
+	}
+}
+
 func TestCleanupWorkerStops(t *testing.T) {
 	s, err := NewStore(Config{Limit: 1, Window: time.Second, CleanupInterval: time.Millisecond}, newFakeClock())
 	if err != nil {
