@@ -176,3 +176,20 @@ func TestEndToEndConcurrentSameUser(t *testing.T) {
 		t.Fatalf("rejected = %d, want %d", got, want)
 	}
 }
+
+// TestEndToEndTrimsUserIDToSharedQuota pins the transport contract that
+// surrounding whitespace is stripped before keying: "  alice  " and "alice"
+// consume the same quota (baseConfig Limit 2).
+func TestEndToEndTrimsUserIDToSharedQuota(t *testing.T) {
+	srv, _ := newServer(t, baseConfig())
+
+	if got := mustStatus(t, srv, "  alice  ", true); got != http.StatusOK {
+		t.Fatalf("first request as '  alice  ': status = %d, want 200", got)
+	}
+	if got := mustStatus(t, srv, "alice", true); got != http.StatusOK {
+		t.Fatalf("second request as 'alice': status = %d, want 200", got)
+	}
+	if got := mustStatus(t, srv, " alice ", true); got != http.StatusTooManyRequests {
+		t.Fatalf("third request as ' alice ': status = %d, want 429 (same trimmed key)", got)
+	}
+}
