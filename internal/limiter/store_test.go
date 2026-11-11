@@ -452,6 +452,66 @@ func TestCleanupWorkerStops(t *testing.T) {
 	s.Close()
 }
 
+// TestStartAfterCloseIsNoOp pins the state machine's terminal transition:
+// once Close has run, Start must never launch a worker. A resurrected
+// sweeper would outlive Close and keep evicting entries forever. Detection
+// side is probabilistic (a broken Start would sweep on a 1ms ticker and evict
+// the deliberately-aged entry within the bounded wait); the pass condition —
+// no worker exists, so the entry cannot be swept — holds for every schedule.
+func TestStartAfterCloseIsNoOp(t *testing.T) {
+	clock := newFakeClock()
+	s, err := NewStore(Config{Limit: 1, Window: time.Second, InactiveAfter: time.Second, CleanupInterval: time.Millisecond}, clock)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	s.Close() // Close before any Start: must return without joining anything
+	s.Start() // must be a no-op
+
+	s.Allow("zombie")
+	clock.Advance(2 * time.Second) // stale for any live sweeper
+	time.Sleep(50 * time.Millisecond)
+	if got := s.Len(); got != 1 {
+		t.Fatalf("stored users = %d, want 1: Start after Close resurrected the sweeper", got)
+	}
+	s.Close() // second Close: still a no-op
+}
+
+// TestConcurrentStartCloseNoLeak hammers the reviewed leak race directly:
+// under the old sync.Once scaffold, a Close that read started==false just
+// before a concurrent Start completed leaked the worker (Close's start-once
+// fallback was already consumed). With the lifeMu-guarded state machine,
+// every interleaving either joins the worker or guarantees none exists, so
+// after all calls return no sweeper may be running — the aged probe entry
+// must survive. Pass is deterministic; catching the old bug was
+// schedule-dependent, which 4x4 goroutines over many trials maximizes.
+func TestConcurrentStartCloseNoLeak(t *testing.T) {
+	const trials = 20
+	const racers = 4
+	for trial := 0; trial < trials; trial++ {
+		clock := newFakeClock()
+		s, err := NewStore(Config{Limit: 1, Window: time.Second, InactiveAfter: time.Second, CleanupInterval: time.Millisecond}, clock)
+		if err != nil {
+			t.Fatalf("NewStore: %v", err)
+		}
+		var wg sync.WaitGroup
+		for i := 0; i < racers; i++ {
+			wg.Add(1)
+			go func() { defer wg.Done(); s.Start() }()
+			wg.Add(1)
+			go func() { defer wg.Done(); s.Close() }()
+		}
+		wg.Wait()
+
+		s.Allow("probe")
+		clock.Advance(2 * time.Second) // stale for any leaked sweeper
+		time.Sleep(20 * time.Millisecond)
+		if got := s.Len(); got != 1 {
+			s.Close()
+			t.Fatalf("trial %d: stored users = %d, want 1: a worker survived every Close", trial, got)
+		}
+	}
+}
+
 func userKey(i int) string {
 	const digits = "0123456789"
 	if i == 0 {

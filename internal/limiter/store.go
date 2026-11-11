@@ -36,10 +36,9 @@ type Store struct {
 
 	stopCh  chan struct{}
 	doneCh  chan struct{}
-	start   sync.Once
-	close   sync.Once
-	lifeMu  sync.Mutex
+	lifeMu  sync.Mutex // guards started and closed; never taken while holding mu
 	started bool
+	closed  bool
 }
 
 // NewStore constructs a Store from cfg. Policy that cannot express a quota is
@@ -151,44 +150,55 @@ func (s *Store) cleanup(now time.Time) {
 	}
 }
 
-// Start launches one cleanup worker. It is safe to call more than once.
+// Start launches the cleanup worker, at most once. It is idempotent, and a
+// no-op after Close: a leaked caller can never resurrect the sweeper.
 func (s *Store) Start() {
-	s.start.Do(func() {
-		s.lifeMu.Lock()
-		s.started = true
-		s.lifeMu.Unlock()
-		go func() {
-			defer close(s.doneCh)
-			ticker := time.NewTicker(s.cfg.CleanupInterval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					s.cleanup(s.clock.Now())
-				case <-s.stopCh:
-					return
-				}
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	if s.started || s.closed {
+		return
+	}
+	s.started = true
+	go func() {
+		defer close(s.doneCh)
+		ticker := time.NewTicker(s.cfg.CleanupInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.cleanup(s.clock.Now())
+			case <-s.stopCh:
+				return
 			}
-		}()
-	})
+		}
+	}()
 }
 
-// Close stops the cleanup worker and waits for it to exit. It is safe to call
-// more than once, including when Start was never called.
+// Close marks the store dead and, if a worker ever started, stops it and
+// waits for it to exit before returning. It is safe to call more than once,
+// including when Start was never called; a concurrent second Close returns
+// as a no-op while the first completes the join.
+//
+// The whole decision runs inside lifeMu as one started/closed state
+// machine. The previous sync.Once scaffold raced: Close observed
+// started==false, a concurrent Start then launched the worker, and Close's
+// fallback — consuming the start-once — was already spent, leaking a goroutine
+// that swept forever (senior review). Under this machine every interleaving
+// either joins the worker or ensures none exists.
 func (s *Store) Close() {
-	s.close.Do(func() {
-		s.lifeMu.Lock()
-		started := s.started
+	s.lifeMu.Lock()
+	if s.closed {
 		s.lifeMu.Unlock()
-		if !started {
-			// Consume the start-once so a later Start cannot launch a worker
-			// after Close has returned.
-			s.start.Do(func() { close(s.doneCh) })
-			return
-		}
+		return
+	}
+	s.closed = true
+	running := s.started
+	s.lifeMu.Unlock()
+
+	if running {
 		close(s.stopCh)
 		<-s.doneCh
-	})
+	}
 }
 
 // Len is intentionally small observability/test support; it is not an API.
