@@ -70,13 +70,26 @@ func TestNewStoreRejectsInvalidConfig(t *testing.T) {
 		t.Fatal("valid config returned a nil Store")
 	}
 
-	// CleanupInterval <= 0 is normalized, not an error; InactiveAfter <= 0 is
-	// deliberately unvalidated (TestCleanupWorkerStops relies on zero).
-	if _, err := NewStore(Config{Limit: 3, Window: time.Minute, CleanupInterval: 0}, newFakeClock()); err != nil {
+	// CleanupInterval <= 0 is normalized, not an error.
+	if _, err := NewStore(Config{Limit: 3, Window: time.Minute, InactiveAfter: 2 * time.Minute, CleanupInterval: 0}, newFakeClock()); err != nil {
 		t.Fatalf("CleanupInterval normalization regressed: %v", err)
 	}
-	if _, err := NewStore(Config{Limit: 3, Window: time.Minute, InactiveAfter: 0}, newFakeClock()); err != nil {
-		t.Fatalf("InactiveAfter must stay unvalidated: %v", err)
+	// InactiveAfter < Window is rejected: a sweep could then evict an entry
+	// whose window is still open and hand the user a fresh quota.
+	for _, cfg := range []Config{
+		{Limit: 3, Window: time.Minute},
+		{Limit: 3, Window: time.Minute, InactiveAfter: time.Second},
+		{Limit: 3, Window: time.Minute, InactiveAfter: time.Minute - time.Nanosecond},
+		{Limit: 3, Window: time.Minute, InactiveAfter: -time.Second},
+	} {
+		if _, err := NewStore(cfg, newFakeClock()); err == nil {
+			t.Fatalf("NewStore(%+v) error = nil, want InactiveAfter < Window rejected", cfg)
+		}
+	}
+	// Exactly Window is legal: the earliest eviction coincides with the
+	// earliest legitimate window reset.
+	if _, err := NewStore(Config{Limit: 3, Window: time.Minute, InactiveAfter: time.Minute}, newFakeClock()); err != nil {
+		t.Fatalf("InactiveAfter == Window must be accepted: %v", err)
 	}
 }
 
@@ -236,13 +249,18 @@ func TestCleanupRemovesInactiveEntries(t *testing.T) {
 // refreshes lastSeen on rejected requests too. If rejections did not count as
 // activity, cleanup could evict a user who is still hammering, and their next
 // request would recreate the entry with a fresh full window — a rate-limit
-// bypass. Needs a custom config (InactiveAfter < Window); testStore's ordering
-// makes the eviction unobservable.
+// bypass. At t0+2m the buggy entry (lastSeen frozen at the accepted request,
+// t0) is exactly InactiveAfter (2m) old, while the correct one (lastSeen from
+// the rejection at t0+30s) is 90s old: Len()==1 is the discriminator. The
+// old follow-up "cleanup must not hand out a fresh window" Allow assertion is
+// gone on purpose — past t0+1m the window has legitimately elapsed, so an
+// evicted-and-recreated entry behaves identically to a retained one; only the
+// sweep can distinguish the implementations.
 func TestRejectedRequestsKeepWindowStateAlive(t *testing.T) {
 	clock := newFakeClock()
 	s, err := NewStore(Config{
-		Limit: 1, Window: 10 * time.Minute,
-		InactiveAfter: time.Minute, CleanupInterval: time.Hour,
+		Limit: 1, Window: time.Minute,
+		InactiveAfter: 2 * time.Minute, CleanupInterval: time.Hour,
 	}, clock)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
@@ -256,13 +274,10 @@ func TestRejectedRequestsKeepWindowStateAlive(t *testing.T) {
 		t.Fatal("second request should be rejected")
 	}
 
-	clock.Advance(30 * time.Second) // lastSeen now 30s ago; window still open
+	clock.Advance(90 * time.Second) // t0+2m; lastSeen 90s ago
 	s.cleanup(clock.Now())
 	if got := s.Len(); got != 1 {
 		t.Fatalf("stored users = %d, want 1: active-but-limited user was cleaned up", got)
-	}
-	if s.Allow("hammerer") {
-		t.Fatal("cleanup must not hand out a fresh window")
 	}
 }
 
@@ -295,19 +310,19 @@ func TestUserKeysAreCaseSensitiveAndEmptyIsOpaque(t *testing.T) {
 func TestCleanupEvictsOnlyInactiveUsers(t *testing.T) {
 	clock := newFakeClock()
 	s, err := NewStore(Config{
-		Limit: 3, Window: 10 * time.Minute,
-		InactiveAfter: time.Minute, CleanupInterval: time.Hour,
+		Limit: 3, Window: time.Minute,
+		InactiveAfter: 2 * time.Minute, CleanupInterval: time.Hour,
 	}, clock)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
 
 	s.Allow("stale") // lastSeen t0
-	clock.Advance(time.Minute)
-	s.Allow("active") // window anchored t0+1m, lastSeen t0+1m
-	clock.Advance(30 * time.Second)
+	clock.Advance(2 * time.Minute)
+	s.Allow("active") // window anchored t0+2m, lastSeen t0+2m
+	clock.Advance(time.Second)
 
-	s.cleanup(clock.Now()) // stale idle 90s >= 60s; active idle 30s
+	s.cleanup(clock.Now()) // stale idle 2m1s >= 2m; active idle 1s
 	if got := s.Len(); got != 1 {
 		t.Fatalf("stored users = %d, want 1 (only the stale user)", got)
 	}
@@ -422,7 +437,7 @@ func TestConcurrentMonotonicClockBurstNoOverAdmission(t *testing.T) {
 }
 
 func TestCleanupWorkerStops(t *testing.T) {
-	s, err := NewStore(Config{Limit: 1, Window: time.Second, CleanupInterval: time.Millisecond}, newFakeClock())
+	s, err := NewStore(Config{Limit: 1, Window: time.Second, InactiveAfter: time.Second, CleanupInterval: time.Millisecond}, newFakeClock())
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}

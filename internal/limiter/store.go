@@ -43,11 +43,13 @@ type Store struct {
 }
 
 // NewStore constructs a Store from cfg. Policy that cannot express a quota is
-// rejected: Limit <= 0 or Window <= 0 returns a non-nil error and a nil Store;
-// callers must treat that as "do not start". A nil clock uses RealClock.
+// rejected: Limit <= 0, Window <= 0, or InactiveAfter < Window returns a
+// non-nil error and a nil Store; callers must treat that as "do not start".
+// InactiveAfter < Window lets a sweep evict an entry whose window is still
+// open, so the user's next request recreates it with a fresh full quota — a
+// reproduced rate-limit bypass (senior review). A nil clock uses RealClock.
 // CleanupInterval <= 0 is normalized to one minute (it is a tuning parameter,
-// not policy). InactiveAfter is not validated: zero or negative is allowed but
-// evicts every entry on the next cleanup tick — keep it >= Window.
+// not policy).
 func NewStore(cfg Config, clock Clock) (*Store, error) {
 	if clock == nil {
 		clock = RealClock{}
@@ -57,6 +59,9 @@ func NewStore(cfg Config, clock Clock) (*Store, error) {
 	}
 	if cfg.Window <= 0 {
 		return nil, fmt.Errorf("limiter: Window must be > 0, got %v", cfg.Window)
+	}
+	if cfg.InactiveAfter < cfg.Window {
+		return nil, fmt.Errorf("limiter: InactiveAfter (%v) must be >= Window (%v)", cfg.InactiveAfter, cfg.Window)
 	}
 	if cfg.CleanupInterval <= 0 {
 		cfg.CleanupInterval = time.Minute
@@ -132,10 +137,10 @@ func (s *Store) Allow(userID string) bool {
 // eviction simply recreates the window. Because Allow refreshes lastSeen on
 // rejected requests too, only genuinely silent users are evicted; an
 // over-limit hammerer keeps its window state and cannot farm fresh quotas.
-// With InactiveAfter <= 0 every stored entry is deleted on the next tick
-// (now - lastSeen >= 0 always); keep it >= Window. A backward clock step
-// makes elapsed negative for recently seen entries, so cleanup can never
-// spuriously evict because of it.
+// NewStore guarantees InactiveAfter >= Window, so a sweep can never evict an
+// entry whose window is still open. A backward clock step makes elapsed
+// negative for recently seen entries, so cleanup can never spuriously evict
+// because of it.
 func (s *Store) cleanup(now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
