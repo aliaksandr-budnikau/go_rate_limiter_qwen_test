@@ -85,8 +85,14 @@ func NewStore(cfg Config, clock Clock) (*Store, error) {
 //   - lastSeen is refreshed on every request, allowed or rejected, so cleanup
 //     cannot evict a user who is still hammering and thereby hand them a fresh
 //     full window.
-//   - The clock is read before locking: one linearization timestamp per
-//     request and no callback while holding s.mu.
+//   - The clock is read INSIDE s.mu: critical sections then observe
+//     non-decreasing timestamps for any monotonic clock, so windowStart can
+//     only exceed now after a genuine step. Reading before the lock lets
+//     ordinary read-vs-lock-acquisition reordering trip the re-anchor guard
+//     and refund consumed quota under bursts (senior review; pinned by
+//     TestConcurrentMonotonicClockBurstNoOverAdmission, whose mutation check
+//     caught exactly this with accepted=4..6 against the unfixed ordering).
+//     Consequence for implementors: a Clock must never call back into Store.
 //   - Config validity (Limit > 0, Window > 0) is guaranteed by NewStore, so
 //     no per-request fail-closed check is needed here.
 //   - userID is opaque policy-wise; blank/missing identity is the transport's
@@ -95,10 +101,10 @@ func NewStore(cfg Config, clock Clock) (*Store, error) {
 // Known fixed-window limitation: up to ~2x Limit across two adjacent window
 // boundaries. Accepted; a sliding window is an out-of-scope extension.
 func (s *Store) Allow(userID string) bool {
-	now := s.clock.Now()
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	now := s.clock.Now() // under the lock: see the semantics comment above
 
 	e := s.entries[userID]
 	if e == nil {

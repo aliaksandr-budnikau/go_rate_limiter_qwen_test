@@ -362,6 +362,65 @@ func TestConcurrentAllowAndCleanup(t *testing.T) {
 	}
 }
 
+// tickClock advances one microsecond per Now call: strictly monotonic (no
+// genuine backward steps exist) yet every caller sees a different timestamp,
+// so bursts exercise timestamp-vs-lock-acquisition reordering deterministically.
+type tickClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func newTickClock() *tickClock {
+	return &tickClock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+}
+
+func (c *tickClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(time.Microsecond)
+	return c.t
+}
+
+// TestConcurrentMonotonicClockBurstNoOverAdmission closes the blind spot of
+// the frozen-clock concurrency tests: with one constant timestamp,
+// read-vs-lock reordering can never occur. The tick clock gives every
+// goroutine a different, strictly increasing time — if Allow read the clock
+// outside s.mu, an inversion (a locker holding a timestamp older than the
+// current windowStart) would trip the backward-step guard and refund consumed
+// quota. The clock never steps back, so for the fixed implementation the
+// guard CANNOT fire under any schedule and exactly Limit must be admitted in
+// every trial: the pass condition is deterministic for all interleavings.
+// Catching the pre-fix bug remains probabilistic, as it is for any race test
+// — forcing the inversion would require a scheduling seam in production code.
+func TestConcurrentMonotonicClockBurstNoOverAdmission(t *testing.T) {
+	const trials = 25
+	const workers = 200
+	for trial := 0; trial < trials; trial++ {
+		s, err := NewStore(Config{
+			Limit: 3, Window: time.Hour,
+			InactiveAfter: 10 * time.Hour, CleanupInterval: 10 * time.Hour,
+		}, newTickClock())
+		if err != nil {
+			t.Fatalf("NewStore: %v", err)
+		}
+		var wg sync.WaitGroup
+		var accepted int32
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if s.Allow("burst") {
+					atomic.AddInt32(&accepted, 1)
+				}
+			}()
+		}
+		wg.Wait()
+		if got := atomic.LoadInt32(&accepted); got != 3 {
+			t.Fatalf("trial %d: accepted = %d, want exactly 3 (over-admission via reordering)", trial, got)
+		}
+	}
+}
+
 func TestCleanupWorkerStops(t *testing.T) {
 	s, err := NewStore(Config{Limit: 1, Window: time.Second, CleanupInterval: time.Millisecond}, newFakeClock())
 	if err != nil {
