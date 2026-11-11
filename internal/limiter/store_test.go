@@ -2,6 +2,7 @@ package limiter
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -116,6 +117,66 @@ func TestWindowResets(t *testing.T) {
 	}
 }
 
+// TestWindowReExhaustionAfterReset pins that rejected requests never consume
+// quota: after exhausting a window and hammering through rejections, the next
+// window must offer the full Limit again — no carry-over debt, no off-by-one.
+func TestWindowReExhaustionAfterReset(t *testing.T) {
+	clock := newFakeClock()
+	s := testStore(t, clock) // Limit 3, Window 1m
+	for i := 0; i < 3; i++ {
+		if !s.Allow("alice") {
+			t.Fatalf("request %d in first window should be accepted", i+1)
+		}
+	}
+	for i := 0; i < 5; i++ {
+		if s.Allow("alice") {
+			t.Fatalf("rejected run: request %d should be denied", 4+i)
+		}
+	}
+	clock.Advance(time.Minute)
+	for i := 0; i < 3; i++ {
+		if !s.Allow("alice") {
+			t.Fatalf("request %d in new window should be accepted (rejections must not eat quota)", i+1)
+		}
+	}
+	if s.Allow("alice") {
+		t.Fatal("fourth request in new window should be rejected")
+	}
+}
+
+// TestClockMovesBackwardReanchorsWindow models an NTP-style step backward:
+// after the jump the stored windowStart lies in the future. Naive elapsed
+// arithmetic (now - windowStart >= Window) then evaluates negative and the
+// user's quota stays stalled until wall clock catches up. Allow must instead
+// re-anchor the window at the arriving request, and cleanup must neither
+// panic nor spuriously evict on negative elapsed time.
+func TestClockMovesBackwardReanchorsWindow(t *testing.T) {
+	clock := newFakeClock()
+	s := testStore(t, clock) // Limit 3, Window 1m, InactiveAfter 2m
+	for i := 0; i < 3; i++ {
+		s.Allow("alice")
+	}
+	if s.Allow("alice") {
+		t.Fatal("quota should be exhausted")
+	}
+
+	clock.Advance(-2 * time.Minute) // windowStart now 2m in the future
+	if !s.Allow("alice") {
+		t.Fatal("backward clock jump must re-anchor the window, not stall the quota")
+	}
+	if !s.Allow("alice") || !s.Allow("alice") {
+		t.Fatal("re-anchored window must offer the full Limit again")
+	}
+	if s.Allow("alice") {
+		t.Fatal("fourth request in re-anchored window should be rejected")
+	}
+
+	s.cleanup(clock.Now()) // negative-elapsed entries must survive, no panic
+	if got := s.Len(); got != 1 {
+		t.Fatalf("stored users = %d, want 1", got)
+	}
+}
+
 func TestConcurrentRequestsSameUser(t *testing.T) {
 	s := testStore(t, newFakeClock())
 	const workers = 100
@@ -202,6 +263,102 @@ func TestRejectedRequestsKeepWindowStateAlive(t *testing.T) {
 	}
 	if s.Allow("hammerer") {
 		t.Fatal("cleanup must not hand out a fresh window")
+	}
+}
+
+// TestUserKeysAreCaseSensitiveAndEmptyIsOpaque pins the documented key
+// contract: userIDs are opaque map keys — "alice" and "Alice" hold
+// independent quotas, and "" (unreachable through the HTTP transport, which
+// 400s blank IDs first) behaves like any other key.
+func TestUserKeysAreCaseSensitiveAndEmptyIsOpaque(t *testing.T) {
+	s := testStore(t, newFakeClock()) // Limit 3
+	for i := 0; i < 3; i++ {
+		s.Allow("alice")
+	}
+	if s.Allow("alice") {
+		t.Fatal("alice should be limited")
+	}
+	if !s.Allow("Alice") {
+		t.Fatal("keys are case-sensitive; Alice has its own quota")
+	}
+	if !s.Allow("") {
+		t.Fatal("empty userID must work as an opaque key")
+	}
+	if got := s.Len(); got != 3 {
+		t.Fatalf("stored users = %d, want 3", got)
+	}
+}
+
+// TestCleanupEvictsOnlyInactiveUsers runs one sweep that must remove a stale
+// user while leaving a recently-active user's entry — and its partially
+// consumed window state — untouched.
+func TestCleanupEvictsOnlyInactiveUsers(t *testing.T) {
+	clock := newFakeClock()
+	s, err := NewStore(Config{
+		Limit: 3, Window: 10 * time.Minute,
+		InactiveAfter: time.Minute, CleanupInterval: time.Hour,
+	}, clock)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+
+	s.Allow("stale") // lastSeen t0
+	clock.Advance(time.Minute)
+	s.Allow("active") // window anchored t0+1m, lastSeen t0+1m
+	clock.Advance(30 * time.Second)
+
+	s.cleanup(clock.Now()) // stale idle 90s >= 60s; active idle 30s
+	if got := s.Len(); got != 1 {
+		t.Fatalf("stored users = %d, want 1 (only the stale user)", got)
+	}
+	// The surviving entry must still be mid-window: two of three left.
+	if !s.Allow("active") || !s.Allow("active") {
+		t.Fatal("active user should keep its remaining quota")
+	}
+	if s.Allow("active") {
+		t.Fatal("fourth request must exhaust the preserved window")
+	}
+}
+
+// TestConcurrentAllowAndCleanup sweeps cleanup hard while 50 goroutines
+// account against the same frozen clock (so no entry can go stale: elapsed
+// stays 0). It proves sweeps and accounting share the lock cleanly under
+// -race and that a sweep never corrupts in-flight quota — accepted must stay
+// exactly Limit and the entry must survive.
+func TestConcurrentAllowAndCleanup(t *testing.T) {
+	clock := newFakeClock()
+	s := testStore(t, clock) // Limit 3, InactiveAfter 2m
+	const allowWorkers = 50
+	const sweepers = 8
+	const sweepsPerGoroutine = 1000
+
+	var wg sync.WaitGroup
+	var accepted int32
+	for i := 0; i < sweepers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < sweepsPerGoroutine; j++ {
+				s.cleanup(clock.Now())
+			}
+		}()
+	}
+	for i := 0; i < allowWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if s.Allow("racer") {
+				atomic.AddInt32(&accepted, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&accepted); got != 3 {
+		t.Fatalf("accepted = %d, want exactly 3", got)
+	}
+	if got := s.Len(); got != 1 {
+		t.Fatalf("stored users = %d, want 1 (frozen clock means nothing is inactive)", got)
 	}
 }
 

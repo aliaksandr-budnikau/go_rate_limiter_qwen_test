@@ -78,6 +78,10 @@ func NewStore(cfg Config, clock Clock) (*Store, error) {
 //     a new window anchored at its own arrival time and resets the count.
 //   - The first Limit requests per window are allowed; the count never carries
 //     across a reset.
+//   - A backward clock step (NTP adjustment) puts windowStart in the future;
+//     negative elapsed can never reach Window, so such a request re-anchors
+//     the window rather than stalling the user's quota until wall clock
+//     catches up. Pinned by TestClockMovesBackwardReanchorsWindow.
 //   - lastSeen is refreshed on every request, allowed or rejected, so cleanup
 //     cannot evict a user who is still hammering and thereby hand them a fresh
 //     full window.
@@ -102,7 +106,7 @@ func (s *Store) Allow(userID string) bool {
 		s.entries[userID] = e
 	}
 
-	if now.Sub(e.windowStart) >= s.cfg.Window {
+	if now.Sub(e.windowStart) >= s.cfg.Window || e.windowStart.After(now) {
 		e.windowStart = now
 		e.count = 0
 	}
@@ -123,7 +127,9 @@ func (s *Store) Allow(userID string) bool {
 // rejected requests too, only genuinely silent users are evicted; an
 // over-limit hammerer keeps its window state and cannot farm fresh quotas.
 // With InactiveAfter <= 0 every stored entry is deleted on the next tick
-// (now - lastSeen >= 0 always); keep it >= Window.
+// (now - lastSeen >= 0 always); keep it >= Window. A backward clock step
+// makes elapsed negative for recently seen entries, so cleanup can never
+// spuriously evict because of it.
 func (s *Store) cleanup(now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
